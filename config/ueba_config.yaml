@@ -1,0 +1,407 @@
+# ============================================================
+# UEBA Anomaly Detection — Configuration File
+# ============================================================
+# This file holds all the tunable parameters for the pipeline.
+# Edit values here to change behavior without touching code.
+# Rules:
+#   - Indentation uses 2 spaces (never tabs)
+#   - Colon-space separates keys from values (key: value)
+#   - Lines starting with # are comments
+# ============================================================
+
+
+# ============================================================
+# SECTION 1 — DATA GENERATION
+# Controls how the synthetic dataset is built.
+# Edit these to change dataset size, number of peer groups,
+# or the baseline behavior of each peer group.
+# ============================================================
+data:
+
+  # Random seed — fixing this makes the dataset reproducible.
+  # Change this number to regenerate with different randomness.
+  random_seed: 42
+
+  # How many days of activity per user.
+  n_days: 60
+
+  # Test window starts on this day.
+  # Days 0 to (test_window_start - 1) → training period
+  # Days test_window_start to (n_days - 1) → evaluation period
+  test_window_start: 53
+
+  # Peer groups — each has its own behavioral baseline.
+  # Add or remove groups here to change the user population.
+  peer_groups:
+
+    engineer:
+      n_users: 400              # how many users in this group
+      log_bytes_mean: 14.5      # average log(bytes) per day
+      logins_mean: 15           # average daily logins
+      hosts_mean: 25            # average daily host connections
+      fails_mean: 1.0           # average daily failed-login rate (Poisson)
+
+    finance:
+      n_users: 250
+      log_bytes_mean: 13.0
+      logins_mean: 8
+      hosts_mean: 5
+      fails_mean: 0.3
+
+    sales:
+      n_users: 250
+      log_bytes_mean: 13.5
+      logins_mean: 12
+      hosts_mean: 40
+      fails_mean: 0.5
+
+    exec:
+      n_users: 100
+      log_bytes_mean: 12.8
+      logins_mean: 6
+      hosts_mean: 8
+      fails_mean: 0.2
+# ============================================================
+# SECTION 2 — ATTACK PLANTING
+# Controls which synthetic attacks get injected into the
+# generated data. Each attack type has its own parameters
+# because attacks differ in shape (multiplier vs additive,
+# duration, target group).
+# ============================================================
+attacks:
+
+  # Random seed for picking which users become attackers.
+  # Separate from data.random_seed so you can regenerate
+  # attack assignments without regenerating users.
+  random_seed: 42
+
+  # ---- Exfiltration ----
+  # Big spike in outbound bytes for several days.
+  # The classic loud attack.
+  exfil:
+    target_group: engineer        # which peer group to attack
+    n_victims: 10                 # how many users get this attack
+    duration_days: 3              # attack lasts this many days
+    start_day_offset: 0           # starts at test_window_start + offset
+    bytes_multiplier: 15          # bytes get multiplied by this
+
+  # ---- Credential theft ----
+  # Failed logins spike (brute force) plus elevated logins
+  # (the successful attempts that follow).
+  cred_theft:
+    target_group: finance
+    n_victims: 10
+    duration_days: 2
+    start_day_offset: 0
+    logins_add: 10                # add to baseline logins
+    fails_add: 5                  # add to baseline failed logins
+
+  # ---- Lateral movement ----
+  # Attacker hops between many internal hosts.
+  lateral:
+    target_group: sales
+    n_victims: 10
+    duration_days: 3
+    start_day_offset: 0
+    hosts_add: 80                 # add to baseline host count
+
+  # ---- Subtle exfiltration ----
+  # Moderate byte spike, non-consecutive days.
+  # Tests detection of more discreet attacks.
+  subtle_exfil:
+    target_group: finance
+    n_victims: 10
+    days_offset: [4, 5]           # specific days into the test window
+    bytes_multiplier: 5
+
+  # ---- Slow ramp ----
+  # The stealth attack — bytes climb monotonically over many days.
+  # Each individual day looks moderate; the signal is in the
+  # whole trajectory shape.
+  slow_ramp:
+    target_group: exec
+    n_victims: 10
+    start_day_offset: 2           # ramp starts test_window_start + 2
+    duration_days: 5
+    ramp_start_multiplier: 1.5    # multiplier on day 1 of ramp
+    ramp_step: 0.5                # increment per subsequent day
+                                  # so days = 1.5×, 2.0×, 2.5×, 3.0×, 3.5×   
+
+# ============================================================
+# SECTION 3 — FEATURE ENGINEERING
+# Toggle feature families on/off and set their parameters.
+# The feature computation code (in src/features.py) only
+# computes families that are enabled here.
+# ============================================================
+features:
+
+  # The 4 raw activity columns measured per user per day.
+  # These are the inputs that ALL feature families operate on.
+  raw_columns:
+    - bytes
+    - logins
+    - hosts
+    - fails
+
+  # Toggle each feature family on or off.
+  # Set to false to skip a family entirely (faster, fewer features).
+  # Set to true to include it in the feature table.
+  enabled_families:
+    self_z: true              # z-score vs user's own past (mean/std)
+    robust_z: true            # robust z vs user's past (median/MAD)
+    peer_z: true              # z-score vs peer group (leave-one-out)
+    rolling: true             # rolling 7-day max/mean/std
+    diff: true                # day-over-day diff and pct change
+    ramp: true                # slope, R², gated signal (ramp detector)
+    spearman: true            # trailing Spearman rank correlation
+
+  # Parameters used inside the feature computations.
+  parameters:
+
+    # Trailing window length for rolling stats (days).
+    # 7 days is one work week — natural cycle length.
+    rolling_window: 7
+
+    # Trailing window length for ramp features (days).
+    # Match rolling_window unless you have a reason to differ.
+    ramp_window: 7
+
+    # Trailing window length for Spearman correlation (days).
+    spearman_window: 7
+
+    # Constant used in MAD-based robust z-score.
+    # 1.4826 makes MAD a consistent estimator of std for
+    # Gaussian-distributed data. Don't change unless you know why.
+    mad_constant: 1.4826
+
+    # Small number added to denominators to prevent divide-by-zero.
+    # Don't lower below 1e-9 (floating point precision risk).
+    epsilon: 1.0e-6
+
+    # Whether to apply a std floor when computing peer z-scores.
+    # Useful when peer groups are small (<5 users). At our scale
+    # (50-400 users per group), not needed.
+    std_floor_enabled: false
+
+    # If std_floor_enabled is true, floors std at half the median
+    # user-level std for that feature. Ignored if floor is disabled.
+    std_floor_fraction: 0.5
+
+# ============================================================
+# SECTION 4 — MODEL
+# The anomaly detection model and its hyperparameters.
+# Currently Isolation Forest is the only supported algorithm.
+# ============================================================
+model:
+
+  # Which algorithm to use.
+  # Adding more options here requires extending src/model.py.
+  algorithm: isolation_forest
+
+  # Number of trees in the forest.
+  # More trees → more stable scores, slower training.
+  # 100 is the sklearn default; 200 gives smoother averaged
+  # scores at modest cost.
+  n_estimators: 200
+
+  # How many samples each tree uses for training.
+  # Counterintuitively, smaller is BETTER for anomaly detection
+  # because it prevents anomalies from "masking" each other
+  # within a tree. 256 is the standard choice from the original
+  # Isolation Forest paper.
+  max_samples: 256
+
+  # Expected fraction of anomalies in the data.
+  # "auto" lets sklearn decide based on the data.
+  # If you have a known attack rate (e.g., 0.05 = 5%), set it.
+  contamination: auto
+
+  # Random seeds to average over.
+  # Isolation Forest uses randomness internally, so a single
+  # run gives noisy scores. We fit the model with each seed,
+  # then average results across seeds for stable metrics.
+  seeds:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+# ============================================================
+# SECTION 5 — EVALUATION
+# How model outputs get scored and which configurations are
+# compared during ablation. This section is the "what do we
+# measure and how" part of the pipeline.
+# ============================================================
+evaluation:
+
+  # The K values at which precision and recall are computed.
+  # The SOC analyst only investigates top-K users, so we
+  # measure detection quality at each plausible threshold.
+  # Lower K = top of the ranking (most confident flags).
+  top_k_values:
+    - 5
+    - 10
+    - 15
+    - 20
+    - 30
+    - 50
+    - 75
+    - 100
+
+  # The primary K used for the headline precision number.
+  # Should be one of the values in top_k_values above.
+  # 50 reflects a realistic SOC investigation budget.
+  primary_top_k: 50
+
+  # Which attack types to track per-attack-type detection for.
+  # Each one gets its own "caught_<type>" metric in results.
+  # Names must match the attack keys in the attacks: section.
+  attack_types_tracked:
+    - exfil
+    - cred_theft
+    - lateral
+    - subtle_exfil
+    - slow_ramp
+
+  # The day on which the evaluation window starts.
+  # Must match data.test_window_start.
+  # Listed here too so evaluation code doesn't have to dig
+  # into the data section.
+  test_window_start: 53
+
+  # How user-level scores are aggregated from row-level scores.
+  # Options: sum, max, mean.
+  # "sum" is what our ablation found to be the best (credits
+  # multi-day patterns). "max" rewards single-day outliers
+  # (worse). "mean" punishes long attacks (worse).
+  aggregation: sum
+
+
+# ============================================================
+# SECTION 5b — ABLATION CONFIGURATIONS
+# Each named config is a list of feature family names to use.
+# Family names must come from features.enabled_families.
+# Raw values are ALWAYS implicitly included.
+# This section is the "which experiments to run" knob.
+# ============================================================
+ablation_configs:
+
+  # Naive baseline — only raw values, no engineered features.
+  baseline: []
+
+  # Just z-scores. Best balance from Week 5 ablation.
+  z_scores:
+    - self_z
+    - robust_z
+    - peer_z
+
+  # Add diff (rate-of-change) on top of z-scores.
+  z_plus_diff:
+    - self_z
+    - robust_z
+    - peer_z
+    - diff
+
+  # Add ramp (R²-based) features on top of z-scores.
+  # Catches slow_ramp at the cost of other attacks.
+  z_plus_ramp:
+    - self_z
+    - robust_z
+    - peer_z
+    - ramp
+
+  # Add Spearman on top of z-scores.
+  # The recommended production config.
+  z_plus_spearman:
+    - self_z
+    - robust_z
+    - peer_z
+    - spearman
+
+  # Add both ramp and Spearman.
+  # Catches the most slow_ramps but sacrifices other attacks.
+  z_plus_ramp_plus_spearman:
+    - self_z
+    - robust_z
+    - peer_z
+    - ramp
+    - spearman
+
+  # Everything enabled — to demonstrate feature dilution.
+  everything:
+    - self_z
+    - robust_z
+    - peer_z
+    - rolling
+    - diff
+    - ramp
+    - spearman   
+# ============================================================
+# SECTION 6 — MLFLOW EXPERIMENT TRACKING
+# Logs every model run (config × seed) to a persistent
+# database so results can be queried, compared, and audited
+# across sessions.
+# ============================================================
+mlflow:
+
+  # Toggle MLflow logging on/off.
+  # Set to false if you're iterating quickly and don't want
+  # to clutter the experiment with throwaway runs.
+  enabled: true
+
+  # Where MLflow stores run records.
+  # SQLite is required for MLflow 3.x (file backend is deprecated).
+  # The path is relative to wherever you run the pipeline from.
+  # In Colab, prefix with /content/ if you want it in the
+  # workspace root.
+  tracking_uri: sqlite:///mlflow.db
+
+  # Name of the experiment in MLflow.
+  # All runs go under this name. Change to start a fresh
+  # experiment without deleting the old data.
+  experiment_name: UEBA_Production_Ablation
+
+  # Tags applied to every run in this experiment.
+  # Useful for filtering in the MLflow UI later.
+  tags:
+    project: ueba
+    phase: final
+    dataset: synthetic_1000_users
+
+# ============================================================
+# SECTION 7 — OUTPUT
+# Where the pipeline writes its results.
+# Edit paths and toggles to control what gets saved.
+# ============================================================
+output:
+
+  # Directory where all output files go.
+  # Created automatically if it doesn't exist.
+  # Paths are relative to wherever the pipeline runs from.
+  results_dir: ./results
+
+  # Save the trained Isolation Forest model to disk.
+  # Useful for reproducing scoring later without retraining.
+  # Files saved as results_dir/model_{config}_{seed}.pkl
+  save_model: true
+
+  # Save the feature table as a parquet file.
+  # Parquet is compressed, fast to reload, and standard in ML.
+  # Lets you skip the feature-computation step on the next run.
+  save_features_parquet: true
+
+  # Save the per-run ablation results as a CSV.
+  # Easier to share with mentors or load into a notebook.
+  save_results_csv: true
+
+  # Generate diagnostic plots:
+  #   - precision-at-K curve
+  #   - per-attack-type detection bar chart
+  #   - feature ablation comparison heatmap
+  # Set to false to skip plotting (saves time during debugging).
+  generate_plots: true
+
+  # Verbose logging during the run.
+  # true  → prints progress, intermediate metrics, warnings
+  # false → only final summary table
+  verbose: true                             
